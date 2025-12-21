@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: yurg
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: "1234"
+    ports:
+      - "5433:5432"
+    volumes:
+      - yurg_pgdata:/var/lib/postgresql/data
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./sql/views.sql:/docker-entrypoint-initdb.d/02_views.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d yurg"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    
+volumes:
+  yurg_pgdata:

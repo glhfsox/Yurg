@@ -1,0 +1,13 @@
+numpy>=1.26
+pandas>=2.2
+requests>=2.32
+python-dotenv>=1.0
+
+SQLAlchemy>=2.0
+psycopg2-binary>=2.9
+
+scikit-learn>=1.5
+joblib>=1.4
+
+xgboost>=2.0
+torch
