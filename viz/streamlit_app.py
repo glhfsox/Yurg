@@ -6,6 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
+from sklearn.metrics import confusion_matrix
 from sqlalchemy import create_engine
 
 
@@ -31,10 +32,11 @@ def load_coin_id(engine, symbol: str) -> int:
 def list_model_versions(engine, coin_id: int) -> list[str]:
     df = pd.read_sql_query(
         """
-        SELECT DISTINCT model_version
+        SELECT model_version, MAX(created_at) AS last_created_at
         FROM predictions_15m
         WHERE coin_id = %(coin_id)s
-        ORDER BY model_version DESC
+        GROUP BY model_version
+        ORDER BY last_created_at DESC
         """,
         engine,
         params={"coin_id": coin_id},
@@ -90,6 +92,34 @@ def load_predictions(engine, coin_id: int, model_version: str, bars: int) -> pd.
         """,
         engine,
         params={"coin_id": coin_id, "model_version": model_version, "bars": int(bars)},
+    )
+    if df.empty:
+        return df
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    return df.sort_values("ts")
+
+def load_eval(engine, coin_id: int, model_version: str, rows: int) -> pd.DataFrame:
+    df = pd.read_sql_query(
+        """
+        SELECT
+          f.ts,
+          f.target_class,
+          p.predicted_class,
+          p.prob_down,
+          p.prob_flat,
+          p.prob_up
+        FROM predictions_15m p
+        JOIN features_15m f
+          ON f.coin_id = p.coin_id
+         AND f.ts = p.ts
+        WHERE p.coin_id = %(coin_id)s
+          AND p.model_version = %(model_version)s
+          AND f.target_class IS NOT NULL
+        ORDER BY p.ts DESC
+        LIMIT %(rows)s
+        """,
+        engine,
+        params={"coin_id": coin_id, "model_version": model_version, "rows": int(rows)},
     )
     if df.empty:
         return df
@@ -161,6 +191,82 @@ def make_prob_chart(df_pred: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def macro_f1_from_confusion(conf: pd.DataFrame) -> float:
+    # conf is 3x3 indexed by true class (rows) and pred class (cols)
+    f1s: list[float] = []
+    for i in range(3):
+        tp = float(conf.iat[i, i])
+        fp = float(conf.iloc[:, i].sum() - tp)
+        fn = float(conf.iloc[i, :].sum() - tp)
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+        f1s.append(f1)
+    return float(sum(f1s) / 3.0)
+
+
+def rolling_metrics(y_true: list[int], y_pred: list[int], window: int) -> tuple[list[float], list[float]]:
+    # Efficient rolling accuracy + macro-F1 via sliding 3x3 confusion counts
+    # Class order: [-1, 0, +1]
+    cls_to_idx = {-1: 0, 0: 1, 1: 2}
+    pairs = [(cls_to_idx[int(t)], cls_to_idx[int(p)]) for t, p in zip(y_true, y_pred)]
+
+    c = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+    correct = 0
+    acc: list[float] = []
+    f1: list[float] = []
+
+    for i, (ti, pi) in enumerate(pairs):
+        c[ti][pi] += 1
+        if ti == pi:
+            correct += 1
+
+        if i >= window:
+            old_ti, old_pi = pairs[i - window]
+            c[old_ti][old_pi] -= 1
+            if old_ti == old_pi:
+                correct -= 1
+
+        denom = min(i + 1, window)
+        acc.append(correct / denom)
+
+        conf = pd.DataFrame(c)
+        f1.append(macro_f1_from_confusion(conf))
+
+    return acc, f1
+
+
+def make_confusion_heatmap(y_true: list[int], y_pred: list[int]) -> go.Figure:
+    labels = [-1, 0, 1]
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=cm,
+            x=[f"pred {l}" for l in labels],
+            y=[f"true {l}" for l in labels],
+            colorscale="Blues",
+            showscale=False,
+            text=cm,
+            texttemplate="%{text}",
+        )
+    )
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), title="Confusion matrix")
+    return fig
+
+
+def make_rolling_chart(ts: pd.Series, acc: list[float], f1: list[float], window: int) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=ts, y=acc, mode="lines", name=f"Rolling accuracy ({window})"))
+    fig.add_trace(go.Scatter(x=ts, y=f1, mode="lines", name=f"Rolling macro-F1 ({window})"))
+    fig.update_layout(
+        height=320,
+        margin=dict(l=10, r=10, t=30, b=10),
+        yaxis=dict(range=[0, 1]),
+        xaxis_title="UTC time",
+    )
+    return fig
+
+
 def main():
     st.set_page_config(page_title="Yurg Dashboard", layout="wide")
     st.title("Yurg — BTC/ETH 15m Dashboard")
@@ -172,10 +278,29 @@ def main():
         bars = st.slider("Bars (15m)", min_value=200, max_value=8000, value=2000, step=200)
         coin_id = load_coin_id(engine, symbol)
         versions = list_model_versions(engine, coin_id)
-        model_version = st.selectbox(
-            "Model version (predictions_15m)",
-            options=(["(none)"] + versions),
-            index=0,
+        auto_latest = st.checkbox("Auto-select latest model", value=True)
+        if auto_latest:
+            model_version = versions[0] if versions else "(none)"
+            st.caption(f"Model version: `{model_version}`")
+        else:
+            model_version = st.selectbox(
+                "Model version (predictions_15m)",
+                options=(["(none)"] + versions),
+                index=0,
+            )
+        eval_rows = st.slider(
+            "Eval rows (labeled + predicted)",
+            min_value=200,
+            max_value=20000,
+            value=5000,
+            step=200,
+        )
+        eval_window = st.slider(
+            "Rolling window",
+            min_value=50,
+            max_value=2000,
+            value=200,
+            step=50,
         )
 
     df_price = load_price(engine, coin_id, bars)
@@ -185,8 +310,10 @@ def main():
 
     df_labels = load_features_labels(engine, coin_id, bars)
     df_pred = pd.DataFrame()
+    df_eval = pd.DataFrame()
     if model_version != "(none)":
         df_pred = load_predictions(engine, coin_id, model_version, bars)
+        df_eval = load_eval(engine, coin_id, model_version, eval_rows)
 
     col1, col2 = st.columns([2, 1], gap="large")
     with col1:
@@ -214,7 +341,30 @@ def main():
         st.subheader("Prediction probabilities")
         st.plotly_chart(make_prob_chart(df_pred), use_container_width=True)
 
+    if model_version != "(none)":
+        st.subheader("Model metrics (where target exists)")
+        if df_eval.empty:
+            st.info("No overlapping labeled targets and predictions yet. Wait for future candles to become labeled.")
+        else:
+            y_true = df_eval["target_class"].astype(int).tolist()
+            y_pred = df_eval["predicted_class"].astype(int).tolist()
+
+            overall_acc = sum(int(t == p) for t, p in zip(y_true, y_pred)) / len(y_true)
+            overall_f1 = macro_f1_from_confusion(
+                pd.DataFrame(confusion_matrix(y_true, y_pred, labels=[-1, 0, 1]))
+            )
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Eval rows", str(len(df_eval)))
+            m2.metric("Accuracy", f"{overall_acc:.3f}")
+            m3.metric("Macro-F1", f"{overall_f1:.3f}")
+
+            st.plotly_chart(make_confusion_heatmap(y_true, y_pred), use_container_width=True)
+
+            window = min(eval_window, len(df_eval))
+            acc, f1 = rolling_metrics(y_true, y_pred, window=window)
+            st.plotly_chart(make_rolling_chart(df_eval["ts"], acc, f1, window), use_container_width=True)
+
 
 if __name__ == "__main__":
     main()
-

@@ -55,6 +55,12 @@ python3 -m model.predict --symbol BTCUSDT --model-version v1
 python3 -m model.predict --symbol ETHUSDT --model-version v1
 ```
 
+To populate metrics on historical data (so the dashboard has something to evaluate), backfill predictions:
+```bash
+python3 -m model.predict --mode backtest --limit 8000 --symbol BTCUSDT --model-version v1
+python3 -m model.predict --mode backtest --limit 8000 --symbol ETHUSDT --model-version v1
+```
+
 ## Visualization (Streamlit)
 Run an interactive dashboard (price + targets + predictions):
 ```bash

@@ -68,7 +68,18 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("MODEL_VERSION"),
         help="Must match the model files in models/.",
     )
-    parser.add_argument("--limit", type=int, default=1)
+    parser.add_argument(
+        "--mode",
+        choices=["live", "backtest"],
+        default="live",
+        help="live: predict only future rows (target_class IS NULL); backtest: predict labeled history.",
+    )
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Recompute predictions even if they already exist for this model_version.",
+    )
     parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
     return parser.parse_args()
 
@@ -109,8 +120,18 @@ def load_model(symbol: str, model_version: str, device: torch.device) -> LoadedM
     )
 
 
-def load_candidates(engine, *, coin_id: int, model_version: str, limit: int) -> pd.DataFrame:
+def load_candidates(
+    engine,
+    *,
+    coin_id: int,
+    model_version: str,
+    limit: int,
+    mode: str,
+    overwrite: bool,
+) -> pd.DataFrame:
     cols = ["ts", *FEATURE_COLUMNS]
+    target_filter = "IS NULL" if mode == "live" else "IS NOT NULL"
+    predicted_filter = "" if overwrite else "AND p.id IS NULL"
     query = f"""
         SELECT f.{", f.".join(cols)}
         FROM features_15m f
@@ -119,8 +140,8 @@ def load_candidates(engine, *, coin_id: int, model_version: str, limit: int) -> 
          AND p.ts = f.ts
          AND p.model_version = %(model_version)s
         WHERE f.coin_id = %(coin_id)s
-          AND f.target_class IS NULL
-          AND p.id IS NULL
+          AND f.target_class {target_filter}
+          {predicted_filter}
         ORDER BY f.ts DESC
         LIMIT %(limit)s
     """
@@ -183,9 +204,26 @@ def main() -> int:
     if coin_id != loaded.coin_id:
         logger.warning("coin_id mismatch (db=%s, model=%s); continuing", coin_id, loaded.coin_id)
 
-    df = load_candidates(engine, coin_id=coin_id, model_version=loaded.model_version, limit=args.limit)
+    if args.limit is None:
+        limit = 1 if args.mode == "live" else 8000
+    else:
+        limit = int(args.limit)
+
+    df = load_candidates(
+        engine,
+        coin_id=coin_id,
+        model_version=loaded.model_version,
+        limit=limit,
+        mode=args.mode,
+        overwrite=bool(args.overwrite),
+    )
     if df.empty:
-        logger.info("No new rows to predict for %s (model_version=%s).", args.symbol, loaded.model_version)
+        logger.info(
+            "No rows to predict for %s (mode=%s, model_version=%s).",
+            args.symbol,
+            args.mode,
+            loaded.model_version,
+        )
         return 0
 
     df = df.dropna(subset=FEATURE_COLUMNS)
