@@ -55,6 +55,12 @@ python3 -m model.predict --symbol BTCUSDT --model-version v1
 python3 -m model.predict --symbol ETHUSDT --model-version v1
 ```
 
+## Visualization (Streamlit)
+Run an interactive dashboard (price + targets + predictions):
+```bash
+streamlit run viz/streamlit_app.py
+```
+
 ## Data Layout
 - `sql/schema.sql`: tables for raw OHLCV, features, predictions
 - `sql/views.sql`: analytics views (daily summary, rolling volatility, signal distribution)
@@ -62,6 +68,7 @@ python3 -m model.predict --symbol ETHUSDT --model-version v1
 - `src/features.py`: features + labels
 - `model/train_model.py`: PyTorch training (GPU-only)
 - `model/predict.py`: inference → `predictions_15m`
+- `viz/streamlit_app.py`: dashboard
 
 ## Notes
 - All timestamps are candle close time (UTC).

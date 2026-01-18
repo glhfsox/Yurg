@@ -11,3 +11,5 @@ joblib>=1.4
 
 xgboost>=2.0
 torch
+streamlit>=1.30
+plotly>=5.18
