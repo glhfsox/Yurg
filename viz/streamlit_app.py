@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
@@ -11,6 +12,14 @@ import streamlit as st
 from dotenv import load_dotenv
 from sklearn.metrics import confusion_matrix
 from sqlalchemy import create_engine
+import torch
+import torch.nn as nn
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.features import FEATURE_COLUMNS  # noqa: E402
 
 
 def get_engine():
@@ -131,6 +140,105 @@ def load_predictions(engine, coin_id: int, model_version: str, bars: int) -> pd.
         return df
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     return df.sort_values("ts")
+
+
+def load_feature_rows(engine, coin_id: int, rows: int) -> pd.DataFrame:
+    cols = ["ts", *FEATURE_COLUMNS, "target_class"]
+    df = pd.read_sql_query(
+        f"""
+        SELECT {", ".join(cols)}
+        FROM features_15m
+        WHERE coin_id = %(coin_id)s
+        ORDER BY ts DESC
+        LIMIT %(rows)s
+        """,
+        engine,
+        params={"coin_id": coin_id, "rows": int(rows)},
+    )
+    if df.empty:
+        return df
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    return df.sort_values("ts")
+
+
+def load_labeled_features(engine, coin_id: int, rows: int) -> pd.DataFrame:
+    cols = ["ts", "target_class", *FEATURE_COLUMNS]
+    df = pd.read_sql_query(
+        f"""
+        SELECT {", ".join(cols)}
+        FROM features_15m
+        WHERE coin_id = %(coin_id)s
+          AND target_class IS NOT NULL
+        ORDER BY ts DESC
+        LIMIT %(rows)s
+        """,
+        engine,
+        params={"coin_id": coin_id, "rows": int(rows)},
+    )
+    if df.empty:
+        return df
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    return df.sort_values("ts")
+
+
+class MLP(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float):
+        super().__init__()
+        layers: list[nn.Module] = []
+        prev = input_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(prev, h))
+            layers.append(nn.BatchNorm1d(h))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            prev = h
+        layers.append(nn.Linear(prev, 3))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+@st.cache_resource
+def load_local_model(symbol: str, model_version: str) -> tuple[nn.Module, np.ndarray, np.ndarray]:
+    meta_path = Path("models") / f"{symbol.lower()}_{model_version}.json"
+    model_path = Path("models") / f"{symbol.lower()}_{model_version}.pt"
+    if not meta_path.exists() or not model_path.exists():
+        raise FileNotFoundError("Model files not found under ./models")
+
+    meta = json.loads(meta_path.read_text())
+    hidden_dims = list(meta.get("model_params", {}).get("hidden_dims", [256, 128]))
+    dropout = float(meta.get("model_params", {}).get("dropout", 0.2))
+    scaler_mean = np.array(meta.get("model_params", {}).get("scaler_mean", []), dtype="float64")
+    scaler_std = np.array(meta.get("model_params", {}).get("scaler_std", []), dtype="float64")
+    if scaler_mean.size == 0 or scaler_std.size == 0:
+        raise RuntimeError("Scaler parameters not found in model metadata.")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for on-the-fly evaluation but is not available.")
+    device = torch.device("cuda")
+
+    model = MLP(input_dim=len(FEATURE_COLUMNS), hidden_dims=hidden_dims, dropout=dropout).to(device)
+    state = torch.load(model_path, map_location=device, weights_only=True)
+    model.load_state_dict(state)
+    model.eval()
+    return model, scaler_mean, scaler_std
+
+
+@torch.no_grad()
+def predict_on_the_fly(
+    model: nn.Module, X: np.ndarray, scaler_mean: np.ndarray, scaler_std: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    # Returns (pred_class, proba) where classes are [-1,0,1] and proba columns are [down, flat, up]
+    scaler_std = np.where(scaler_std == 0, 1.0, scaler_std)
+    Xs = (X - scaler_mean) / scaler_std
+    xb = torch.tensor(Xs, dtype=torch.float32, device=torch.device("cuda"))
+    logits = model(xb)
+    proba = torch.softmax(logits, dim=1).detach().cpu().numpy()
+    pred_idx = np.argmax(proba, axis=1)
+    idx_to_class = {0: -1, 1: 0, 2: 1}
+    pred_class = np.vectorize(idx_to_class.get)(pred_idx).astype(int)
+    return pred_class, proba
 
 def load_eval(engine, coin_id: int, model_version: str, rows: int) -> pd.DataFrame:
     df = pd.read_sql_query(
@@ -349,6 +457,28 @@ def main():
         df_pred = load_predictions(engine, coin_id, model_version, bars)
         df_eval = load_eval(engine, coin_id, model_version, eval_rows)
 
+        # If DB has no predictions for this model_version yet, compute on-the-fly predictions
+        # so charts/Latest/probabilities still work for the newest trained model.
+        if df_pred.empty:
+            try:
+                df_feat = load_feature_rows(engine, coin_id, bars).dropna(subset=FEATURE_COLUMNS)
+                if not df_feat.empty:
+                    model, scaler_mean, scaler_std = load_local_model(symbol, model_version)
+                    X = df_feat[FEATURE_COLUMNS].to_numpy(dtype="float64")
+                    pred_class, proba = predict_on_the_fly(model, X, scaler_mean, scaler_std)
+                    df_pred = pd.DataFrame(
+                        {
+                            "ts": df_feat["ts"].values,
+                            "predicted_class": pred_class,
+                            "prob_down": proba[:, 0],
+                            "prob_flat": proba[:, 1],
+                            "prob_up": proba[:, 2],
+                        }
+                    )
+            except Exception:
+                # Metrics block will show the error if needed; charts can still render without predictions.
+                pass
+
     col1, col2 = st.columns([2, 1], gap="large")
     with col1:
         st.subheader("Price + targets + predictions")
@@ -378,24 +508,48 @@ def main():
     if model_version != "(none)":
         st.subheader("Model metrics (where target exists)")
         if df_eval.empty:
-            st.info("No overlapping labeled targets and predictions yet. Wait for future candles to become labeled.")
-        else:
-            y_true = df_eval["target_class"].astype(int).tolist()
-            y_pred = df_eval["predicted_class"].astype(int).tolist()
+            st.info(
+                "No overlapping labeled targets and DB-stored predictions for this model yet. "
+                "Computing metrics on-the-fly from local model files (not persisted to DB)..."
+            )
+            try:
+                df_lab = load_labeled_features(engine, coin_id, eval_rows).dropna(subset=FEATURE_COLUMNS)
+                if df_lab.empty:
+                    st.info("No labeled feature rows available yet.")
+                    return
+                model, scaler_mean, scaler_std = load_local_model(symbol, model_version)
+                X = df_lab[FEATURE_COLUMNS].to_numpy(dtype="float64")
+                pred_class, proba = predict_on_the_fly(model, X, scaler_mean, scaler_std)
+                df_eval = pd.DataFrame(
+                    {
+                        "ts": df_lab["ts"].values,
+                        "target_class": df_lab["target_class"].astype(int).values,
+                        "predicted_class": pred_class,
+                        "prob_down": proba[:, 0],
+                        "prob_flat": proba[:, 1],
+                        "prob_up": proba[:, 2],
+                    }
+                )
+            except Exception as exc:
+                st.error(f"On-the-fly evaluation failed: {exc}")
+                st.stop()
 
-            overall_acc = sum(int(t == p) for t, p in zip(y_true, y_pred)) / len(y_true)
-            overall_f1 = macro_f1_from_confusion(confusion_matrix(y_true, y_pred, labels=[-1, 0, 1]))
+        y_true = df_eval["target_class"].astype(int).tolist()
+        y_pred = df_eval["predicted_class"].astype(int).tolist()
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Eval rows", str(len(df_eval)))
-            m2.metric("Accuracy", f"{overall_acc:.3f}")
-            m3.metric("Macro-F1", f"{overall_f1:.3f}")
+        overall_acc = sum(int(t == p) for t, p in zip(y_true, y_pred)) / len(y_true)
+        overall_f1 = macro_f1_from_confusion(confusion_matrix(y_true, y_pred, labels=[-1, 0, 1]))
 
-            st.plotly_chart(make_confusion_heatmap(y_true, y_pred), use_container_width=True)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Eval rows", str(len(df_eval)))
+        m2.metric("Accuracy", f"{overall_acc:.3f}")
+        m3.metric("Macro-F1", f"{overall_f1:.3f}")
 
-            window = min(eval_window, len(df_eval))
-            acc, f1 = rolling_metrics(y_true, y_pred, window=window)
-            st.plotly_chart(make_rolling_chart(df_eval["ts"], acc, f1, window), use_container_width=True)
+        st.plotly_chart(make_confusion_heatmap(y_true, y_pred), use_container_width=True)
+
+        window = min(eval_window, len(df_eval))
+        acc, f1 = rolling_metrics(y_true, y_pred, window=window)
+        st.plotly_chart(make_rolling_chart(df_eval["ts"], acc, f1, window), use_container_width=True)
 
 
 if __name__ == "__main__":
