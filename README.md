@@ -48,6 +48,7 @@ python3 -m src.features --full
 python3 -m model.train_model --symbol BTCUSDT --model-version v1
 python3 -m model.train_model --symbol ETHUSDT --model-version v1
 ```
+`model.train_model` runs walk-forward validation by default. To skip CV: `--cv none`.
 
 7) Predict latest bars:
 ```bash
@@ -57,8 +58,8 @@ python3 -m model.predict --symbol ETHUSDT --model-version v1
 
 To populate metrics on historical data (so the dashboard has something to evaluate), backfill predictions:
 ```bash
-python3 -m model.predict --mode backtest --limit 8000 --symbol BTCUSDT --model-version v1
-python3 -m model.predict --mode backtest --limit 8000 --symbol ETHUSDT --model-version v1
+python3 -m model.predict --mode backtest --limit 20000 --symbol BTCUSDT --model-version v1
+python3 -m model.predict --mode backtest --limit 20000 --symbol ETHUSDT --model-version v1
 ```
 
 ## Visualization (Streamlit)

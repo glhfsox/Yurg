@@ -205,7 +205,7 @@ def main() -> int:
         logger.warning("coin_id mismatch (db=%s, model=%s); continuing", coin_id, loaded.coin_id)
 
     if args.limit is None:
-        limit = 1 if args.mode == "live" else 8000
+        limit = 1 if args.mode == "live" else 20000
     else:
         limit = int(args.limit)
 

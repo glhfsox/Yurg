@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -29,7 +32,24 @@ def load_coin_id(engine, symbol: str) -> int:
     return int(df.iloc[0]["coin_id"])
 
 
-def list_model_versions(engine, coin_id: int) -> list[str]:
+def list_model_versions(engine, coin_id: int, symbol: str) -> list[str]:
+    local_versions: dict[str, pd.Timestamp] = {}
+    models_dir = Path("models")
+    if models_dir.exists():
+        for meta_path in models_dir.glob(f"{symbol.lower()}_*.json"):
+            try:
+                meta = json.loads(meta_path.read_text())
+                mv = str(meta.get("model_version", ""))
+                trained_at = meta.get("trained_at_utc")
+                if not mv or not trained_at:
+                    continue
+                ts = pd.to_datetime(trained_at, utc=True, errors="coerce")
+                if pd.isna(ts):
+                    continue
+                local_versions[mv] = ts
+            except Exception:
+                continue
+
     df = pd.read_sql_query(
         """
         SELECT model_version, MAX(created_at) AS last_created_at
@@ -41,7 +61,21 @@ def list_model_versions(engine, coin_id: int) -> list[str]:
         engine,
         params={"coin_id": coin_id},
     )
-    return [str(x) for x in df["model_version"].tolist()]
+    db_versions: dict[str, pd.Timestamp] = {}
+    if not df.empty:
+        for _, row in df.iterrows():
+            mv = str(row["model_version"])
+            ts = pd.to_datetime(row["last_created_at"], utc=True, errors="coerce")
+            if mv and not pd.isna(ts):
+                db_versions[mv] = ts
+
+    # Prefer "latest model" by trained_at_utc if available; otherwise fall back to DB recency.
+    all_versions = set(db_versions) | set(local_versions)
+
+    def sort_key(mv: str) -> pd.Timestamp:
+        return local_versions.get(mv) or db_versions.get(mv) or pd.Timestamp.min
+
+    return sorted(all_versions, key=sort_key, reverse=True)
 
 
 def load_price(engine, coin_id: int, bars: int) -> pd.DataFrame:
@@ -191,13 +225,14 @@ def make_prob_chart(df_pred: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def macro_f1_from_confusion(conf: pd.DataFrame) -> float:
-    # conf is 3x3 indexed by true class (rows) and pred class (cols)
+def macro_f1_from_confusion(cm: np.ndarray) -> float:
+    # cm is 3x3 indexed by true class (rows) and pred class (cols)
+    cm = np.asarray(cm, dtype="float64")
     f1s: list[float] = []
     for i in range(3):
-        tp = float(conf.iat[i, i])
-        fp = float(conf.iloc[:, i].sum() - tp)
-        fn = float(conf.iloc[i, :].sum() - tp)
+        tp = float(cm[i, i])
+        fp = float(cm[:, i].sum() - tp)
+        fn = float(cm[i, :].sum() - tp)
         prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
@@ -230,8 +265,7 @@ def rolling_metrics(y_true: list[int], y_pred: list[int], window: int) -> tuple[
         denom = min(i + 1, window)
         acc.append(correct / denom)
 
-        conf = pd.DataFrame(c)
-        f1.append(macro_f1_from_confusion(conf))
+        f1.append(macro_f1_from_confusion(np.asarray(c, dtype="float64")))
 
     return acc, f1
 
@@ -277,7 +311,7 @@ def main():
         symbol = st.selectbox("Symbol", ["BTCUSDT", "ETHUSDT"], index=0)
         bars = st.slider("Bars (15m)", min_value=200, max_value=8000, value=2000, step=200)
         coin_id = load_coin_id(engine, symbol)
-        versions = list_model_versions(engine, coin_id)
+        versions = list_model_versions(engine, coin_id, symbol)
         auto_latest = st.checkbox("Auto-select latest model", value=True)
         if auto_latest:
             model_version = versions[0] if versions else "(none)"
@@ -350,9 +384,7 @@ def main():
             y_pred = df_eval["predicted_class"].astype(int).tolist()
 
             overall_acc = sum(int(t == p) for t, p in zip(y_true, y_pred)) / len(y_true)
-            overall_f1 = macro_f1_from_confusion(
-                pd.DataFrame(confusion_matrix(y_true, y_pred, labels=[-1, 0, 1]))
-            )
+            overall_f1 = macro_f1_from_confusion(confusion_matrix(y_true, y_pred, labels=[-1, 0, 1]))
 
             m1, m2, m3 = st.columns(3)
             m1.metric("Eval rows", str(len(df_eval)))

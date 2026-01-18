@@ -51,6 +51,25 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("MODEL_VERSION"),
         help="Stored in predictions_15m (default: MODEL_VERSION).",
     )
+    parser.add_argument(
+        "--cv",
+        choices=["walk_forward", "none"],
+        default="walk_forward",
+        help="walk_forward: expanding-window validation on pre-test history; none: skip CV.",
+    )
+    parser.add_argument("--wf-folds", type=int, default=5, help="Walk-forward fold count.")
+    parser.add_argument(
+        "--wf-min-train-frac",
+        type=float,
+        default=0.5,
+        help="Minimum train fraction of the pre-test period for the first fold.",
+    )
+    parser.add_argument(
+        "--wf-val-frac",
+        type=float,
+        default=0.05,
+        help="Validation window size as a fraction of the full dataset length.",
+    )
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -144,6 +163,45 @@ def standardize_transform(X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> n
     return (X - mean) / std
 
 
+def compute_class_weights(y_train_idx: np.ndarray) -> np.ndarray:
+    counts = np.bincount(y_train_idx, minlength=3).astype("float64")
+    return counts.sum() / np.maximum(counts, 1.0)
+
+
+def build_walk_forward_splits(
+    *,
+    n_total: int,
+    n_trainval: int,
+    folds: int,
+    min_train_frac: float,
+    val_frac: float,
+) -> list[tuple[int, int]]:
+    if folds <= 0:
+        raise ValueError("--wf-folds must be > 0")
+    if not (0.0 < min_train_frac < 1.0):
+        raise ValueError("--wf-min-train-frac must be in (0, 1)")
+    if not (0.0 < val_frac < 1.0):
+        raise ValueError("--wf-val-frac must be in (0, 1)")
+
+    val_size = max(500, int(n_total * val_frac))
+    min_train = max(2000, int(n_trainval * min_train_frac))
+
+    splits: list[tuple[int, int]] = []
+    train_end = min_train
+    for _ in range(folds):
+        val_end = train_end + val_size
+        if val_end > n_trainval:
+            break
+        splits.append((train_end, val_end))
+        train_end += val_size
+
+    if not splits:
+        raise ValueError(
+            f"Not enough data for walk-forward CV (n_total={n_total}, n_trainval={n_trainval})."
+        )
+    return splits
+
+
 def train_epoch(model, loader, optimizer, criterion, device) -> float:
     model.train()
     total_loss = 0.0
@@ -177,6 +235,75 @@ def predict_proba(model, X: np.ndarray, device: torch.device) -> np.ndarray:
     return proba
 
 
+def train_one_split(
+    *,
+    X_train: np.ndarray,
+    y_train_idx: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    hidden_dims: list[int],
+    dropout: float,
+    log_prefix: str,
+) -> dict[str, Any]:
+    mean, std = standardize_fit(X_train)
+    X_train_s = standardize_transform(X_train, mean, std)
+    X_val_s = standardize_transform(X_val, mean, std)
+
+    model = MLP(input_dim=X_train_s.shape[1], hidden_dims=hidden_dims, dropout=dropout).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    weights = compute_class_weights(y_train_idx)
+    class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    train_dataset = torch.utils.data.TensorDataset(
+        to_tensor(X_train_s, device), torch.tensor(y_train_idx, device=device, dtype=torch.long)
+    )
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, drop_last=False
+    )
+
+    best_val_f1 = -1.0
+    best_state = None
+    best_epoch = 0
+    patience = 5
+    patience_left = patience
+
+    for epoch in range(epochs):
+        loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        val_pred = predict_classes(model, X_val_s, device)
+        val_f1 = f1_score(y_val, val_pred, average="macro")
+
+        logger.info("%s epoch=%s loss=%.5f val_macro_f1=%.4f", log_prefix, epoch + 1, loss, val_f1)
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = float(val_f1)
+            best_epoch = int(epoch + 1)
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            patience_left = patience
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                logger.info("%s early stopping", log_prefix)
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    val_pred = predict_classes(model, X_val_s, device)
+    return {
+        "best_epoch": best_epoch,
+        "val_metrics": eval_metrics(y_val, val_pred),
+        "scaler_mean": mean,
+        "scaler_std": std,
+        "class_weights": weights,
+        "state_dict": {k: v.detach().clone() for k, v in model.state_dict().items()},
+    }
+
+
 def main() -> int:
     args = parse_args()
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(message)s")
@@ -197,6 +324,7 @@ def main() -> int:
 
     df = df.dropna(subset=FEATURE_COLUMNS + ["target_class"])
     train_df, val_df, test_df = split_time(df)
+    trainval_df = pd.concat([train_df, val_df], axis=0)
 
     X_train = train_df[FEATURE_COLUMNS].to_numpy(dtype="float64")
     X_val = val_df[FEATURE_COLUMNS].to_numpy(dtype="float64")
@@ -217,58 +345,93 @@ def main() -> int:
     )
 
     y_train_idx = np.vectorize(CLASS_TO_INDEX.get)(y_train)
-    y_val_idx = np.vectorize(CLASS_TO_INDEX.get)(y_val)
-    y_test_idx = np.vectorize(CLASS_TO_INDEX.get)(y_test)
 
     hidden_dims = [256, 128]
     dropout = 0.2
 
-    mean, std = standardize_fit(X_train)
-    X_train = standardize_transform(X_train, mean, std)
-    X_val = standardize_transform(X_val, mean, std)
-    X_test = standardize_transform(X_test, mean, std)
+    if args.cv == "walk_forward":
+        splits = build_walk_forward_splits(
+            n_total=len(df),
+            n_trainval=len(trainval_df),
+            folds=int(args.wf_folds),
+            min_train_frac=float(args.wf_min_train_frac),
+            val_frac=float(args.wf_val_frac),
+        )
+        wf_folds: list[dict[str, Any]] = []
+        for i, (tr_end, v_end) in enumerate(splits, start=1):
+            fold_train = trainval_df.iloc[:tr_end]
+            fold_val = trainval_df.iloc[tr_end:v_end]
+            X_tr = fold_train[FEATURE_COLUMNS].to_numpy(dtype="float64")
+            y_tr = fold_train["target_class"].to_numpy(dtype="int64")
+            y_tr_idx = np.vectorize(CLASS_TO_INDEX.get)(y_tr)
+            X_v = fold_val[FEATURE_COLUMNS].to_numpy(dtype="float64")
+            y_v = fold_val["target_class"].to_numpy(dtype="int64")
 
-    model = MLP(input_dim=X_train.shape[1], hidden_dims=hidden_dims, dropout=dropout).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    counts = np.bincount(y_train_idx, minlength=3).astype("float64")
-    weights = counts.sum() / np.maximum(counts, 1.0)
-    class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+            result = train_one_split(
+                X_train=X_tr,
+                y_train_idx=y_tr_idx,
+                X_val=X_v,
+                y_val=y_v,
+                device=device,
+                epochs=int(args.epochs),
+                batch_size=int(args.batch_size),
+                lr=float(args.lr),
+                hidden_dims=hidden_dims,
+                dropout=dropout,
+                log_prefix=f"wf{i}",
+            )
+            wf_folds.append(
+                {
+                    "fold": i,
+                    "train_rows": int(len(fold_train)),
+                    "val_rows": int(len(fold_val)),
+                    "best_epoch": int(result["best_epoch"]),
+                    "val_metrics": result["val_metrics"],
+                }
+            )
 
-    train_dataset = torch.utils.data.TensorDataset(
-        to_tensor(X_train, device), torch.tensor(y_train_idx, device=device, dtype=torch.long)
+        wf_macro_f1 = [f["val_metrics"]["macro_f1"] for f in wf_folds]
+        wf_acc = [f["val_metrics"]["accuracy"] for f in wf_folds]
+        metrics["walk_forward"] = {
+            "folds": wf_folds,
+            "mean_macro_f1": float(np.mean(wf_macro_f1)),
+            "std_macro_f1": float(np.std(wf_macro_f1)),
+            "mean_accuracy": float(np.mean(wf_acc)),
+            "std_accuracy": float(np.std(wf_acc)),
+            "config": {
+                "folds": int(args.wf_folds),
+                "min_train_frac": float(args.wf_min_train_frac),
+                "val_frac": float(args.wf_val_frac),
+            },
+        }
+
+    single = train_one_split(
+        X_train=X_train,
+        y_train_idx=y_train_idx,
+        X_val=X_val,
+        y_val=y_val,
+        device=device,
+        epochs=int(args.epochs),
+        batch_size=int(args.batch_size),
+        lr=float(args.lr),
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        log_prefix="main",
     )
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False
-    )
+    mean = single["scaler_mean"]
+    std = single["scaler_std"]
+    weights = single["class_weights"]
 
-    best_val_f1 = -1.0
-    best_state = None
-    patience = 5
-    patience_left = patience
+    X_val_s = standardize_transform(X_val, mean, std)
+    X_test_s = standardize_transform(X_test, mean, std)
 
-    for epoch in range(args.epochs):
-        loss = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_pred = predict_classes(model, X_val, device)
-        val_f1 = f1_score(y_val, val_pred, average="macro")
+    model = MLP(input_dim=X_test_s.shape[1], hidden_dims=hidden_dims, dropout=dropout).to(device)
+    model.load_state_dict(single["state_dict"])
+    model.eval()
 
-        logger.info("epoch=%s loss=%.5f val_macro_f1=%.4f", epoch + 1, loss, val_f1)
-
-        if val_f1 > best_val_f1:
-            best_val_f1 = float(val_f1)
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-            patience_left = patience
-        else:
-            patience_left -= 1
-            if patience_left <= 0:
-                logger.info("Early stopping triggered.")
-                break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    test_pred = predict_classes(model, X_test, device)
-    metrics["mlp_test"] = eval_metrics(y_test, test_pred)
+    metrics["mlp_best_epoch"] = int(single["best_epoch"])
+    metrics["mlp_val"] = eval_metrics(y_val, predict_classes(model, X_val_s, device))
+    metrics["mlp_test"] = eval_metrics(y_test, predict_classes(model, X_test_s, device))
 
     out_dir = Path("models")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -297,7 +460,14 @@ def main() -> int:
 
     logger.info("Saved model: %s", model_path)
     logger.info("Saved metadata: %s", meta_path)
-    logger.info("Test metrics: %s", json.dumps({"mlp_test": metrics["mlp_test"]}, indent=2))
+    summary = {"mlp_val": metrics.get("mlp_val"), "mlp_test": metrics.get("mlp_test")}
+    if "walk_forward" in metrics:
+        summary["walk_forward"] = {
+            "mean_accuracy": metrics["walk_forward"]["mean_accuracy"],
+            "mean_macro_f1": metrics["walk_forward"]["mean_macro_f1"],
+            "folds": len(metrics["walk_forward"]["folds"]),
+        }
+    logger.info("Metrics summary: %s", json.dumps(summary, indent=2))
     return 0
 
 
