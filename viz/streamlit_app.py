@@ -4,7 +4,8 @@ import json
 import os
 from pathlib import Path
 import sys
-
+from typing import Any
+import datetime
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -199,6 +200,161 @@ class MLP(nn.Module):
         return self.net(x)
 
 
+def _parse_utc_ts(value: Any) -> pd.Timestamp:
+    if value is None or value == "":
+        return pd.Timestamp(0, tz="UTC")
+    ts = pd.to_datetime(str(value), utc=True, errors="coerce")
+    if pd.isna(ts):
+        return pd.Timestamp(0, tz="UTC")
+    return ts  # type: ignore[return-value]
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _coerce_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+@st.cache_data
+def load_local_model_metadatas(symbol: str) -> list[dict[str, Any]]:
+    models_dir = Path("models")
+    if not models_dir.exists():
+        return []
+    metas: list[dict[str, Any]] = []
+    for meta_path in models_dir.glob(f"{symbol.lower()}_*.json"):
+        try:
+            meta = json.loads(meta_path.read_text())
+            if not isinstance(meta, dict):
+                continue
+            mv = meta.get("model_version")
+            if not mv:
+                # Fallback to filename: btcusdt_v4.json -> v4
+                mv = meta_path.stem.split("_", 1)[-1]
+                meta["model_version"] = mv
+            meta["_meta_path"] = str(meta_path)
+            metas.append(meta)
+        except Exception:
+            continue
+
+    def sort_key(m: dict[str, Any]) -> pd.Timestamp:
+        return _parse_utc_ts(m.get("trained_at_utc"))
+
+    return sorted(metas, key=sort_key, reverse=True)
+
+
+def summarize_model_metas(metas: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for meta in metas:
+        metrics = meta.get("metrics", {}) if isinstance(meta.get("metrics"), dict) else {}
+        wf = metrics.get("walk_forward", {}) if isinstance(metrics.get("walk_forward"), dict) else {}
+        wf_cfg = wf.get("config", {}) if isinstance(wf.get("config"), dict) else {}
+        wf_folds = wf.get("folds", []) if isinstance(wf.get("folds"), list) else []
+
+        def metric_block(name: str) -> dict[str, Any]:
+            blk = metrics.get(name, {})
+            if not isinstance(blk, dict):
+                return {}
+            return {
+                f"{name}.acc": _coerce_float(blk.get("accuracy")),
+                f"{name}.macro_f1": _coerce_float(blk.get("macro_f1")),
+            }
+
+        row: dict[str, Any] = {
+            "model_version": str(meta.get("model_version", "")),
+            "trained_at_utc": _parse_utc_ts(meta.get("trained_at_utc")),
+            "theta": _coerce_float(meta.get("theta")),
+            "wf.folds": len(wf_folds) if wf_folds else None,
+            "wf.mean_acc": _coerce_float(wf.get("mean_accuracy")),
+            "wf.std_acc": _coerce_float(wf.get("std_accuracy")),
+            "wf.mean_macro_f1": _coerce_float(wf.get("mean_macro_f1")),
+            "wf.std_macro_f1": _coerce_float(wf.get("std_macro_f1")),
+            "wf.cfg.min_train_frac": _coerce_float(wf_cfg.get("min_train_frac")),
+            "wf.cfg.val_frac": _coerce_float(wf_cfg.get("val_frac")),
+            "_meta_path": meta.get("_meta_path"),
+        }
+        row.update(metric_block("mlp_val"))
+        row.update(metric_block("mlp_test"))
+        row.update(metric_block("baseline_majority_val"))
+        row.update(metric_block("baseline_majority_test"))
+        row.update(metric_block("baseline_ret_sign_val"))
+        row.update(metric_block("baseline_ret_sign_test"))
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.sort_values("trained_at_utc", ascending=False, na_position="last")
+    # Display-friendly formatting (keep raw numeric types for sorting/plots).
+    return df
+
+
+def load_walk_forward_folds(meta: dict[str, Any]) -> pd.DataFrame:
+    metrics = meta.get("metrics", {}) if isinstance(meta.get("metrics"), dict) else {}
+    wf = metrics.get("walk_forward", {}) if isinstance(metrics.get("walk_forward"), dict) else {}
+    folds = wf.get("folds", []) if isinstance(wf.get("folds"), list) else []
+    rows: list[dict[str, Any]] = []
+    for f in folds:
+        if not isinstance(f, dict):
+            continue
+        vm = f.get("val_metrics", {}) if isinstance(f.get("val_metrics"), dict) else {}
+        rows.append(
+            {
+                "fold": _coerce_int(f.get("fold")),
+                "train_rows": _coerce_int(f.get("train_rows")),
+                "val_rows": _coerce_int(f.get("val_rows")),
+                "best_epoch": _coerce_int(f.get("best_epoch")),
+                "val_accuracy": _coerce_float(vm.get("accuracy")),
+                "val_macro_f1": _coerce_float(vm.get("macro_f1")),
+                "confusion_matrix": vm.get("confusion_matrix"),
+            }
+        )
+    df = pd.DataFrame(rows).dropna(subset=["fold"])
+    if df.empty:
+        return df
+    return df.sort_values("fold")
+
+
+def make_cv_fold_chart(df_folds: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df_folds["fold"],
+            y=df_folds["val_accuracy"],
+            mode="lines+markers",
+            name="Fold val accuracy",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df_folds["fold"],
+            y=df_folds["val_macro_f1"],
+            mode="lines+markers",
+            name="Fold val macro-F1",
+        )
+    )
+    fig.update_layout(
+        height=320,
+        margin=dict(l=10, r=10, t=30, b=10),
+        yaxis=dict(range=[0, 1], title="Score"),
+        xaxis=dict(title="Fold #", tickmode="linear", dtick=1),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        title="Walk-forward CV scores by fold",
+    )
+    return fig
+
+
 @st.cache_resource
 def load_local_model(symbol: str, model_version: str) -> tuple[nn.Module, np.ndarray, np.ndarray]:
     meta_path = Path("models") / f"{symbol.lower()}_{model_version}.json"
@@ -239,6 +395,7 @@ def predict_on_the_fly(
     idx_to_class = {0: -1, 1: 0, 2: 1}
     pred_class = np.vectorize(idx_to_class.get)(pred_idx).astype(int)
     return pred_class, proba
+
 
 def load_eval(engine, coin_id: int, model_version: str, rows: int) -> pd.DataFrame:
     df = pd.read_sql_query(
@@ -445,111 +602,233 @@ def main():
             step=50,
         )
 
-    df_price = load_price(engine, coin_id, bars)
-    if df_price.empty:
-        st.error("No OHLCV data found. Run ingestion first.")
-        st.stop()
+    tab_dashboard, tab_cv = st.tabs(["Dashboard", "CV report"])
 
-    df_labels = load_features_labels(engine, coin_id, bars)
-    df_pred = pd.DataFrame()
-    df_eval = pd.DataFrame()
-    if model_version != "(none)":
-        df_pred = load_predictions(engine, coin_id, model_version, bars)
-        df_eval = load_eval(engine, coin_id, model_version, eval_rows)
+    with tab_dashboard:
+        df_price = load_price(engine, coin_id, bars)
+        if df_price.empty:
+            st.error("No OHLCV data found. Run ingestion first.")
+            st.stop()
 
-        # If DB has no predictions for this model_version yet, compute on-the-fly predictions
-        # so charts/Latest/probabilities still work for the newest trained model.
-        if df_pred.empty:
-            try:
-                df_feat = load_feature_rows(engine, coin_id, bars).dropna(subset=FEATURE_COLUMNS)
-                if not df_feat.empty:
+        df_labels = load_features_labels(engine, coin_id, bars)
+        df_pred = pd.DataFrame()
+        df_eval = pd.DataFrame()
+        if model_version != "(none)":
+            df_pred = load_predictions(engine, coin_id, model_version, bars)
+            df_eval = load_eval(engine, coin_id, model_version, eval_rows)
+
+            # If DB has no predictions for this model_version yet, compute on-the-fly predictions
+            # so charts/Latest/probabilities still work for the newest trained model.
+            if df_pred.empty:
+                try:
+                    df_feat = load_feature_rows(engine, coin_id, bars).dropna(subset=FEATURE_COLUMNS)
+                    if not df_feat.empty:
+                        model, scaler_mean, scaler_std = load_local_model(symbol, model_version)
+                        X = df_feat[FEATURE_COLUMNS].to_numpy(dtype="float64")
+                        pred_class, proba = predict_on_the_fly(model, X, scaler_mean, scaler_std)
+                        df_pred = pd.DataFrame(
+                            {
+                                "ts": df_feat["ts"].values,
+                                "predicted_class": pred_class,
+                                "prob_down": proba[:, 0],
+                                "prob_flat": proba[:, 1],
+                                "prob_up": proba[:, 2],
+                            }
+                        )
+                except Exception:
+                    # Metrics block will show the error if needed; charts can still render without predictions.
+                    pass
+
+        col1, col2 = st.columns([2, 1], gap="large")
+        with col1:
+            st.subheader("Price + targets + predictions")
+            st.plotly_chart(make_price_chart(df_price, df_labels, df_pred), use_container_width=True)
+
+        with col2:
+            st.subheader("Latest")
+            latest = df_price.iloc[-1]
+            st.metric("Last close", f"{latest['close']:.2f}", help=str(latest["ts"]))
+            st.metric("Last volume", f"{latest['volume']:.2f}")
+            if not df_pred.empty:
+                last_p = df_pred.iloc[-1]
+                st.write(f"Model version: `{model_version}`")
+                st.write(f"Predicted class: `{int(last_p['predicted_class'])}`")
+                st.write(
+                    {
+                        "prob_down": float(last_p["prob_down"]),
+                        "prob_flat": float(last_p["prob_flat"]),
+                        "prob_up": float(last_p["prob_up"]),
+                    }
+                )
+
+        if not df_pred.empty:
+            st.subheader("Prediction probabilities")
+            st.plotly_chart(make_prob_chart(df_pred), use_container_width=True)
+
+        if model_version != "(none)":
+            st.subheader("Model metrics (where target exists)")
+            if df_eval.empty:
+                st.info(
+                    "No overlapping labeled targets and DB-stored predictions for this model yet. "
+                    "Computing metrics on-the-fly from local model files (not persisted to DB)..."
+                )
+                try:
+                    df_lab = load_labeled_features(engine, coin_id, eval_rows).dropna(
+                        subset=FEATURE_COLUMNS
+                    )
+                    if df_lab.empty:
+                        st.info("No labeled feature rows available yet.")
+                        return
                     model, scaler_mean, scaler_std = load_local_model(symbol, model_version)
-                    X = df_feat[FEATURE_COLUMNS].to_numpy(dtype="float64")
+                    X = df_lab[FEATURE_COLUMNS].to_numpy(dtype="float64")
                     pred_class, proba = predict_on_the_fly(model, X, scaler_mean, scaler_std)
-                    df_pred = pd.DataFrame(
+                    df_eval = pd.DataFrame(
                         {
-                            "ts": df_feat["ts"].values,
+                            "ts": df_lab["ts"].values,
+                            "target_class": df_lab["target_class"].astype(int).values,
                             "predicted_class": pred_class,
                             "prob_down": proba[:, 0],
                             "prob_flat": proba[:, 1],
                             "prob_up": proba[:, 2],
                         }
                     )
-            except Exception:
-                # Metrics block will show the error if needed; charts can still render without predictions.
-                pass
+                except Exception as exc:
+                    st.error(f"On-the-fly evaluation failed: {exc}")
+                    st.stop()
 
-    col1, col2 = st.columns([2, 1], gap="large")
-    with col1:
-        st.subheader("Price + targets + predictions")
-        st.plotly_chart(make_price_chart(df_price, df_labels, df_pred), use_container_width=True)
+            y_true = df_eval["target_class"].astype(int).tolist()
+            y_pred = df_eval["predicted_class"].astype(int).tolist()
 
-    with col2:
-        st.subheader("Latest")
-        latest = df_price.iloc[-1]
-        st.metric("Last close", f"{latest['close']:.2f}", help=str(latest["ts"]))
-        st.metric("Last volume", f"{latest['volume']:.2f}")
-        if not df_pred.empty:
-            last_p = df_pred.iloc[-1]
-            st.write(f"Model version: `{model_version}`")
-            st.write(f"Predicted class: `{int(last_p['predicted_class'])}`")
-            st.write(
-                {
-                    "prob_down": float(last_p["prob_down"]),
-                    "prob_flat": float(last_p["prob_flat"]),
-                    "prob_up": float(last_p["prob_up"]),
-                }
+            overall_acc = sum(int(t == p) for t, p in zip(y_true, y_pred)) / len(y_true)
+            overall_f1 = macro_f1_from_confusion(confusion_matrix(y_true, y_pred, labels=[-1, 0, 1]))
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Eval rows", str(len(df_eval)), help="Number of labeled rows used for evaluation.")
+            m2.metric("Accuracy", f"{overall_acc:.3f}", help="Fraction of correct predictions.")
+            m3.metric(
+                "Macro-F1",
+                f"{overall_f1:.3f}",
+                help="Average F1 across classes (-1, 0, +1). Treats all classes equally.",
             )
 
-    if not df_pred.empty:
-        st.subheader("Prediction probabilities")
-        st.plotly_chart(make_prob_chart(df_pred), use_container_width=True)
+            st.plotly_chart(make_confusion_heatmap(y_true, y_pred), use_container_width=True)
 
-    if model_version != "(none)":
-        st.subheader("Model metrics (where target exists)")
-        if df_eval.empty:
+            window = min(eval_window, len(df_eval))
+            acc, f1 = rolling_metrics(y_true, y_pred, window=window)
+            st.plotly_chart(make_rolling_chart(df_eval["ts"], acc, f1, window), use_container_width=True)
+
+    with tab_cv:
+        st.subheader("Cross-validation report (walk-forward)")
+        st.caption(
+            "This tab reads per-model training metadata from `models/*.json` and shows time-series CV "
+            "results. Walk-forward CV is an expanding-window validation designed for time-ordered data "
+            "(no shuffling)."
+        )
+
+        metas = load_local_model_metadatas(symbol)
+        if not metas:
             st.info(
-                "No overlapping labeled targets and DB-stored predictions for this model yet. "
-                "Computing metrics on-the-fly from local model files (not persisted to DB)..."
+                "No local model metadata found under `models/`. Train a model first "
+                "(`python3 -m model.train_model ...`)."
             )
-            try:
-                df_lab = load_labeled_features(engine, coin_id, eval_rows).dropna(subset=FEATURE_COLUMNS)
-                if df_lab.empty:
-                    st.info("No labeled feature rows available yet.")
-                    return
-                model, scaler_mean, scaler_std = load_local_model(symbol, model_version)
-                X = df_lab[FEATURE_COLUMNS].to_numpy(dtype="float64")
-                pred_class, proba = predict_on_the_fly(model, X, scaler_mean, scaler_std)
-                df_eval = pd.DataFrame(
-                    {
-                        "ts": df_lab["ts"].values,
-                        "target_class": df_lab["target_class"].astype(int).values,
-                        "predicted_class": pred_class,
-                        "prob_down": proba[:, 0],
-                        "prob_flat": proba[:, 1],
-                        "prob_up": proba[:, 2],
-                    }
+            return
+
+        df_summary = summarize_model_metas(metas)
+        if df_summary.empty:
+            st.info("No readable model metadata found.")
+            return
+
+        st.markdown("**Model summary**")
+        st.dataframe(
+            df_summary.drop(columns=["_meta_path"], errors="ignore"),
+            use_container_width=True,
+            hide_index=True,
+        )
+        with st.expander("How to read the table"):
+            st.markdown(
+                "- **`mlp_val.*`**: metrics on a single validation split (recent history).\n"
+                "- **`mlp_test.*`**: metrics on a held-out future test split (best proxy for live).\n"
+                "- **`wf.*`**: walk-forward CV results across multiple time-ordered folds "
+                "(mean/std show average performance + stability).\n"
+                "- **`baseline_*`**: simple baselines (useful sanity checks).\n"
+                "- **Accuracy**: share of correct class predictions.\n"
+                "- **Macro-F1**: average F1 over classes (-1/0/+1), so rare classes matter."
+            )
+
+        version_options = [str(m.get("model_version")) for m in metas if m.get("model_version")]
+        if not version_options:
+            st.info("No `model_version` found in local metadata files.")
+            st.stop()
+        default_version = model_version if model_version in version_options else version_options[0]
+        inspect_version = st.selectbox(
+            "Inspect model version",
+            options=version_options,
+            index=version_options.index(default_version),
+            help="Shows per-fold walk-forward validation results saved during training.",
+        )
+
+        meta = next(m for m in metas if str(m.get("model_version")) == inspect_version)
+        metrics = meta.get("metrics", {}) if isinstance(meta.get("metrics"), dict) else {}
+        wf = metrics.get("walk_forward") if isinstance(metrics.get("walk_forward"), dict) else None
+
+        st.markdown("**Walk-forward CV**")
+        if not wf:
+            st.info(
+                "This model metadata does not include walk-forward CV results. "
+                "Re-train with `--cv walk_forward` (default)."
+            )
+        else:
+            wf_cfg = wf.get("config", {}) if isinstance(wf.get("config"), dict) else {}
+            c1, c2, c3, c4 = st.columns(4)
+            mean_acc = _coerce_float(wf.get("mean_accuracy"))
+            mean_f1 = _coerce_float(wf.get("mean_macro_f1"))
+            std_f1 = _coerce_float(wf.get("std_macro_f1"))
+            c1.metric(
+                "Folds",
+                str(_coerce_int(wf_cfg.get("folds")) or len(wf.get("folds", []))),
+                help="How many sequential validation splits were evaluated.",
+            )
+            c2.metric(
+                "Mean accuracy",
+                f"{mean_acc:.3f}" if mean_acc is not None else "n/a",
+                help="Average validation accuracy across folds.",
+            )
+            c3.metric(
+                "Mean macro-F1",
+                f"{mean_f1:.3f}" if mean_f1 is not None else "n/a",
+                help="Average validation macro-F1 across folds (better for class imbalance).",
+            )
+            c4.metric(
+                "Stability (std macro-F1)",
+                f"{std_f1:.3f}" if std_f1 is not None else "n/a",
+                help="Standard deviation of macro-F1 across folds (lower = more stable).",
+            )
+
+            st.caption(
+                f"Config: `min_train_frac={wf_cfg.get('min_train_frac')}`, "
+                f"`val_frac={wf_cfg.get('val_frac')}`. "
+                "Each fold trains on earlier history and validates on the next contiguous chunk."
+            )
+
+            df_folds = load_walk_forward_folds(meta)
+            if df_folds.empty:
+                st.info("No fold details found in metadata.")
+            else:
+                st.plotly_chart(make_cv_fold_chart(df_folds), use_container_width=True)
+                st.dataframe(
+                    df_folds.drop(columns=["confusion_matrix"], errors="ignore"),
+                    use_container_width=True,
+                    hide_index=True,
                 )
-            except Exception as exc:
-                st.error(f"On-the-fly evaluation failed: {exc}")
-                st.stop()
 
-        y_true = df_eval["target_class"].astype(int).tolist()
-        y_pred = df_eval["predicted_class"].astype(int).tolist()
-
-        overall_acc = sum(int(t == p) for t, p in zip(y_true, y_pred)) / len(y_true)
-        overall_f1 = macro_f1_from_confusion(confusion_matrix(y_true, y_pred, labels=[-1, 0, 1]))
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Eval rows", str(len(df_eval)))
-        m2.metric("Accuracy", f"{overall_acc:.3f}")
-        m3.metric("Macro-F1", f"{overall_f1:.3f}")
-
-        st.plotly_chart(make_confusion_heatmap(y_true, y_pred), use_container_width=True)
-
-        window = min(eval_window, len(df_eval))
-        acc, f1 = rolling_metrics(y_true, y_pred, window=window)
-        st.plotly_chart(make_rolling_chart(df_eval["ts"], acc, f1, window), use_container_width=True)
+                with st.expander("What do these terms mean?"):
+                    st.markdown(
+                        "- **Fold**: one time-ordered train → validate split.\n"
+                        "- **Train rows / Val rows**: how many labeled candles were used in that fold.\n"
+                        "- **Accuracy**: share of correctly predicted classes.\n"
+                        "- **Macro-F1**: average F1 for each class (-1/0/+1), so rare classes matter.\n"
+                        "- **Best epoch**: epoch chosen by early stopping (best validation macro-F1)."
+                    )
 
 
 if __name__ == "__main__":
